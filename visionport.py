@@ -10,14 +10,12 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from ultralytics import YOLO
+
+from detectors import DETECTORS, detect_objects
 
 ROOT = Path(__file__).parent
 OUTPUTS = ROOT / "outputs"
 OUTPUTS.mkdir(exist_ok=True)
-VEHICLE_CLASSES = {"bicycle", "car", "motorcycle", "bus", "truck"}
-model = YOLO(str(ROOT / "yolov8n.pt"))
-
 app = FastAPI(title="VisionPort Traffic Detection API")
 app.add_middleware(
     CORSMiddleware,
@@ -37,22 +35,16 @@ def density_for(count: int) -> str:
     return "High"
 
 
-def analyze_frame(frame: np.ndarray) -> tuple[np.ndarray, list[dict]]:
-    result = model(frame, verbose=False)[0]
-    detections = []
-    names = result.names
-    for box in result.boxes:
-        label = names[int(box.cls[0])]
-        if label not in VEHICLE_CLASSES:
-            continue
-        confidence = float(box.conf[0])
-        x1, y1, x2, y2 = [round(float(value)) for value in box.xyxy[0]]
-        detections.append({
-            "name": label,
-            "confidence": round(confidence, 3),
-            "box": [x1, y1, x2, y2],
-        })
-    return result.plot(), detections
+def analyze_frame(
+    frame: np.ndarray, category: str = "all"
+) -> tuple[np.ndarray, list[dict]]:
+    labels = DETECTORS.get(category)
+    if category not in DETECTORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown detector '{category}'. Choose from: {', '.join(DETECTORS)}.",
+        )
+    return detect_objects(frame, labels)
 
 
 def image_response(image: np.ndarray) -> StreamingResponse:
@@ -81,16 +73,16 @@ async def health():
 
 
 @app.post("/detect/")
-async def detect_objects(file: UploadFile = File(...)):
+async def detect_objects_endpoint(file: UploadFile = File(...), category: str = "all"):
     image = await read_image(file)
-    annotated, detections = analyze_frame(image)
+    annotated, detections = analyze_frame(image, category)
     return image_response(annotated)
 
 
 @app.post("/analyze-image/")
-async def analyze_image(file: UploadFile = File(...)):
+async def analyze_image(file: UploadFile = File(...), category: str = "all"):
     image = await read_image(file)
-    annotated, detections = analyze_frame(image)
+    annotated, detections = analyze_frame(image, category)
     ok, encoded = cv2.imencode(".jpg", annotated)
     if not ok:
         raise HTTPException(status_code=500, detail="Could not encode the processed image.")
@@ -103,9 +95,16 @@ async def analyze_image(file: UploadFile = File(...)):
 
 
 @app.post("/analyze-video/")
-async def analyze_video(file: UploadFile = File(...), frame_step: int = 10):
+async def analyze_video(
+    file: UploadFile = File(...), frame_step: int = 10, category: str = "all"
+):
     if frame_step < 1:
         raise HTTPException(status_code=400, detail="frame_step must be at least 1.")
+    if category not in DETECTORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown detector '{category}'. Choose from: {', '.join(DETECTORS)}.",
+        )
 
     job_id = uuid.uuid4().hex
     job_dir = OUTPUTS / job_id
@@ -136,7 +135,7 @@ async def analyze_video(file: UploadFile = File(...), frame_step: int = 10):
             ok, frame = capture.read()
             if not ok:
                 break
-            annotated, detections = analyze_frame(frame)
+            annotated, detections = analyze_frame(frame, category)
             writer.write(annotated)
             if frame_number % frame_step == 0:
                 frame_path = frames_dir / f"frame_{frame_number:06d}.jpg"
