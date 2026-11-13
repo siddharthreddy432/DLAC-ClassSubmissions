@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VisionPort Traffic Analyzer</title>
+  <style>
+    body { margin: 0; font: 16px Arial, sans-serif; background: #eef2f7; color: #172033; }
+    main { max-width: 1100px; margin: auto; padding: 28px; }
+    header, section { background: white; border-radius: 12px; padding: 22px; margin-bottom: 18px; box-shadow: 0 2px 12px #17203318; }
+    h1 { margin-top: 0; } button, input { margin: 6px 6px 6px 0; padding: 10px; }
+    button { cursor: pointer; border: 0; border-radius: 6px; background: #1463d8; color: white; }
+    button:disabled { background: #8d99aa; cursor: wait; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
+    .metric { background: #f4f7fb; padding: 15px; border-radius: 8px; }
+    img, video { max-width: 100%; max-height: 520px; border-radius: 8px; background: #18202d; }
+    #camera { display: none; } #message { color: #a32121; min-height: 22px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 15px; }
+    td, th { text-align: left; padding: 8px; border-bottom: 1px solid #dce2ea; }
+    .frames { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .frames img { width: 150px; height: 95px; object-fit: cover; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>VisionPort Traffic Analyzer</h1>
+    <p>Capture images, play traffic videos, extract frames, and detect vehicles with YOLOv8.</p>
+    <div class="grid">
+      <div class="metric"><b>System:</b> <span id="status">Checking...</span></div>
+      <div class="metric"><b>Model:</b> YOLOv8 Nano</div>
+      <div class="metric"><b>Vehicles:</b> <span id="count">0</span></div>
+      <div class="metric"><b>Traffic density:</b> <span id="density">-</span></div>
+    </div>
+  </header>
+
+  <section>
+    <h2>Camera capture</h2>
+    <video id="camera" autoplay playsinline></video>
+    <canvas id="canvas" hidden></canvas>
+    <button id="start-camera">Start camera</button>
+    <button id="capture" disabled>Capture and analyze</button>
+  </section>
+
+  <section>
+    <h2>Image detection</h2>
+    <input id="image-file" type="file" accept="image/*">
+    <button id="analyze-image">Analyze image</button>
+    <div id="message"></div>
+    <img id="image-output" alt="Annotated image output">
+    <table><thead><tr><th>Vehicle</th><th>Confidence</th><th>Bounding box</th></tr></thead>
+      <tbody id="detections"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Video playback, detection, and frame extraction</h2>
+    <input id="video-file" type="file" accept="video/*">
+    <label>Analyze every <input id="frame-step" type="number" min="1" value="10" style="width:60px"> frames</label>
+    <button id="analyze-video">Process video</button>
+    <video id="video-output" controls></video>
+    <p id="video-summary"></p>
+    <div id="frames" class="frames"></div>
+  </section>
+</main>
+<script>
+  // The UI may be opened by FastAPI (port 8000), Live Server (usually 5500),
+  // or directly from disk. Only the FastAPI origin exposes the API routes.
+  const apiBase = window.location.port === "8000" ? "" : "http://localhost:8000";
+  const $ = (id) => document.getElementById(id);
+  const showError = (error) => { $("message").textContent = error.message; };
+  const setMetrics = (data) => {
+    $("count").textContent = data.count ?? data.max_vehicles_in_frame ?? 0;
+    $("density").textContent = data.density ?? "-";
+  };
+  async function postFile(url, file, extra = {}) {
+    const form = new FormData(); form.append("file", file);
+    const response = await fetch(`${apiBase}${url}?${new URLSearchParams(extra)}`, { method: "POST", body: form });
+    if (!response.ok) throw new Error((await response.json()).detail || "Request failed");
+    return response.json();
+  }
+  function displayImage(data) {
+    $("image-output").src = `data:image/jpeg;base64,${data.image}`;
+    $("detections").innerHTML = data.detections.map((d) =>
+      `<tr><td>${d.name}</td><td>${(d.confidence * 100).toFixed(1)}%</td><td>${d.box.join(", ")}</td></tr>`
+    ).join("");
+    setMetrics(data);
+  }
+  $("start-camera").onclick = async () => {
+    try {
+      $("camera").srcObject = await navigator.mediaDevices.getUserMedia({ video: true });
+      $("camera").style.display = "block"; $("capture").disabled = false;
+    } catch (error) { showError(error); }
+  };
+  $("capture").onclick = async () => {
+    $("canvas").width = $("camera").videoWidth; $("canvas").height = $("camera").videoHeight;
+    $("canvas").getContext("2d").drawImage($("camera"), 0, 0);
+    $("canvas").toBlob(async (blob) => {
+      try { displayImage(await postFile("/analyze-image/", blob)); } catch (error) { showError(error); }
+    }, "image/jpeg");
+  };
+  $("analyze-image").onclick = async () => {
+    const file = $("image-file").files[0]; if (!file) return showError(new Error("Choose an image first."));
+    try { displayImage(await postFile("/analyze-image/", file)); } catch (error) { showError(error); }
+  };
+  $("analyze-video").onclick = async () => {
+    const file = $("video-file").files[0]; if (!file) return showError(new Error("Choose a video first."));
+    try {
+      const data = await postFile("/analyze-video/", file, { frame_step: $("frame-step").value });
+      $("video-output").src = `${apiBase}${data.video}`;
+      $("video-summary").textContent = `${data.frame_count} frames processed; maximum ${data.max_vehicles_in_frame} vehicles; density: ${data.density}.`;
+      $("frames").innerHTML = data.frames.map((src) => `<img src="${apiBase}${src}" alt="Extracted frame">`).join("");
+      setMetrics({ max_vehicles_in_frame: data.max_vehicles_in_frame, density: data.density });
+    } catch (error) { showError(error); }
+  };
+  fetch(`${apiBase}/health`).then((r) => r.json()).then(() => $("status").textContent = "Active")
+    .catch(() => $("status").textContent = "Backend unavailable");
+</script>
+</body>
+</html>
